@@ -13,6 +13,8 @@ This directory is not itself discovered - the registry only matches
 ``player_<digits>`` - so the template can never appear in a run as a competitor.
 """
 
+from itertools import combinations
+
 from models.player import GameContext, PlayerSnapshot, Selection, TurnContext
 from models.player import Player as BasePlayer
 
@@ -98,31 +100,68 @@ class Player1(BasePlayer):
 		forfeit is visible rather than silent. Your failure never affects the
 		other groups.
 		"""
+		if self.days_seen == 0:
+			self.total_budget = turn.budget_remaining
 		self.days_seen += 1
 
-		socks_by_colors = sorted((sock, i) for i, sock in enumerate(offered))
+		if self.is_well_clustered(turn):
+			return self.well_clustered_selection(offered, turn)
 
-		best_pair = (socks_by_colors[0][1], socks_by_colors[1][1])
-		best_diff = socks_by_colors[1][0] - socks_by_colors[0][0]
-		for (left, left_i), (right, right_i) in zip(
-			socks_by_colors, socks_by_colors[1:], strict=False
-		):
-			diff = right - left
-			if diff < best_diff:
-				best_diff = diff
-				best_pair = (left_i, right_i)
+		free = [
+			(a, b)
+			for a, b in combinations(range(len(offered)), 2)
+			if abs(offered[a] - offered[b]) <= 6
+		]
+
+		if free:
+			pair = min(free, key=lambda p: self._wears(offered[p[0]]) + self._wears(offered[p[1]]))
+		else:
+			by_shade = sorted((sock, i) for i, sock in enumerate(offered))
+			pair = (by_shade[0][1], by_shade[1][1])
+			best_diff = by_shade[1][0] - by_shade[0][0]
+			for (left, left_i), (right, right_i) in zip(by_shade, by_shade[1:], strict=False):
+				diff = right - left
+				if diff < best_diff:
+					best_diff = diff
+					pair = (left_i, right_i)
 
 		threshold = self.choose_discard_threshold(turn)
 		discard = []
 		for c in range(len(offered)):
-			if (
-				c not in best_pair
-				and offered[c] >= threshold
-				and offered[c] <= (255 - threshold * 2)
-			):
+			if c not in pair and offered[c] >= threshold and offered[c] <= (255 - threshold * 2):
 				discard.append(c)
+		return Selection(wear=pair, discard=tuple(discard))
 
-		return Selection(wear=best_pair, discard=tuple(discard))
+	@staticmethod
+	def _wears(shade: int) -> float:
+		"""Return the number of wears a sock has seen, as a float."""
+		return (255 - shade) / 2 if shade > 64 else float(shade)
+
+	def is_well_clustered(self, turn: TurnContext) -> bool:
+		return self.total_budget == turn.budget_remaining
+
+	def well_clustered_selection(self, offered: tuple[int, ...], turn: TurnContext) -> Selection:
+		by_shade = sorted((sock, i) for i, sock in enumerate(offered))
+		(darkest, darkest_i), (dark_next, dark_next_i) = by_shade[0], by_shade[1]
+		(light_next, light_next_i), (lightest, lightest_i) = by_shade[-2], by_shade[-1]
+
+		dark_pair = (darkest_i, dark_next_i)
+		light_pair = (light_next_i, lightest_i)
+		dark_diff = dark_next - darkest
+		light_diff = lightest - light_next
+		dark_free = dark_diff <= 6
+		light_free = light_diff <= 6
+
+		if dark_free and light_free:
+			pair = dark_pair if self._wears(darkest) <= self._wears(lightest) else light_pair
+		elif dark_free:
+			pair = dark_pair
+		elif light_free:
+			pair = light_pair
+		else:
+			pair = dark_pair if dark_diff <= light_diff else light_pair
+
+		return Selection(wear=pair)
 
 	def choose_discard_threshold(self, turn: TurnContext) -> float:
 		days_left = float(self.days - turn.day)
@@ -130,6 +169,6 @@ class Player1(BasePlayer):
 		threshold = (
 			5.0 * self.roommates * days_left / turn.budget_remaining
 			if turn.budget_remaining > 0
-			else 6
+			else 65
 		)
-		return threshold if threshold > 6 else 6 + 4
+		return threshold if threshold > 6 else 6

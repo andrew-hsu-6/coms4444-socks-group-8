@@ -13,9 +13,10 @@ This directory is not itself discovered - the registry only matches
 ``player_<digits>`` - so the template can never appear in a run as a competitor.
 """
 
+import math
 from itertools import combinations
 
-from core.engine import PACK_COST
+# from core.engine import PACK_COST
 from models.player import GameContext, PlayerSnapshot, Selection, TurnContext
 from models.player import Player as BasePlayer
 
@@ -112,50 +113,56 @@ class Player10(BasePlayer):
 		"""
 		self.days_seen += 1
 
-		# check for all pairs within threshold of 6 since embarrassment is 0 for anything less than 6
-		pairs_within_threshold = [
-			p
-			for p in combinations(range(len(offered)), 2)
-			if abs(offered[p[0]] - offered[p[1]]) <= THRESHOLD
-		]
-		if pairs_within_threshold:  # if there are pairs that fall within 6
-			# take the most extreme pair like closest to 255 since we want it to become more grey and uniform - white socks
-			i, j = min(
-				pairs_within_threshold,
-				key=lambda p: self.aging(offered[p[0]]) + self.aging(offered[p[1]]),
-			)
-		else:
-			# if there are no pairs within threshold, be greedy
-			i, j = min(
-				combinations(range(len(offered)), 2),
-				key=lambda p: abs(offered[p[0]] - offered[p[1]]),
-			)
+		# Find the minimum embarrassment among all possible pairs
+		all_pairs = list(combinations(range(len(offered)), 2))
 
-		worn = (offered[i] + offered[j]) / 2
+		min_difference = min(abs(offered[p[0]] - offered[p[1]]) for p in all_pairs)
+
+		# Keep only pairs tied for the lowest embarrassment
+		best_pairs = [p for p in all_pairs if abs(offered[p[0]] - offered[p[1]]) == min_difference]
+
+		# Among those:
+		# 1. prefer the pair with the greatest total aging
+		# 2. if aging is tied, prefer the pair whose average shade is closest to 0
+		i, j = min(
+			best_pairs,
+			key=lambda p: (
+				-(self.aging(offered[p[0]]) + self.aging(offered[p[1]])),
+				(offered[p[0]] + offered[p[1]]) / 2,
+			),
+		)
 
 		discard: list[int] = []
 		days_remaining = max(self.days - turn.day + 1, 1)
 
-		# check if we have an inf budget, otherwise we add a variable to pace our spending based on days remaining and budget remaining
+		# Calculate the age threshold l:
+		#
+		#     B / ((2dn / l) * (10 / 6)) = 1
+		#
+		# Solving for l:
+		#
+		#     l = (10 * d * n) / (3 * B)
+		#
+		# where:
+		#   B = remaining budget
+		#   d = remaining days
+		#   n = number of roommates
+		#
+		# Always round l up to the nearest integer.
+
 		if turn.budget_remaining is None or turn.budget_remaining == float('inf'):
-			buy_pack = True
+			age_threshold = 0
+		elif turn.budget_remaining <= 0:
+			age_threshold = float('inf')
 		else:
-			daily_rate = turn.budget_remaining / days_remaining
-			buy_pack = daily_rate >= (PACK_COST / 6)
+			age_threshold = math.ceil(
+				(10 * days_remaining * self.roommates) / (3 * turn.budget_remaining)
+			)
 
-		if turn.budget_remaining >= PACK_COST and buy_pack:
-			leftovers = [k for k in range(len(offered)) if k not in (i, j)]
-			# wait a week before discarding, dont want to discard too early but just put a week for now
-			if turn.day >= 7 and leftovers:
-				# discard socks that have ageed 15 units and are beyond threshold - need to fix this later to account more for future distribution
-				discardable = [
-					k
-					for k in leftovers
-					if self.aging(offered[k]) >= 15 and abs(offered[k] - worn) > THRESHOLD
-				]
-				# if you can discard something take the worst and discard it
-				if discardable:
-					worst = max(discardable, key=lambda k: abs(offered[k] - worn))
-					discard.append(worst)
+		# Look only at socks we are not wearing
+		leftovers = [k for k in range(len(offered)) if k not in (i, j)]
 
-		return Selection(wear=(i, j), discard=(tuple(discard)))
+		# Discard every leftover sock whose age is at least l
+		discard = [k for k in leftovers if self.aging(offered[k]) >= age_threshold]
+
+		return Selection(wear=(i, j), discard=tuple(discard))
