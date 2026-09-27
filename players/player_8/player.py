@@ -15,10 +15,13 @@ This directory is not itself discovered - the registry only matches
 
 from dataclasses import dataclass
 from itertools import combinations
-from math import isclose, pi, sin
+from math import isclose
 
+from core.engine import PACK_COST, PACK_SIZE
 from models.player import GameContext, PlayerSnapshot, Selection, TurnContext
 from models.player import Player as BasePlayer
+
+SOCK_COST = PACK_COST / PACK_SIZE
 
 
 @dataclass(frozen=True)
@@ -106,6 +109,15 @@ class Player8(BasePlayer):
 	# <1 is more conservative. Endpoints and the shifted center stay fixed.
 	discard_aggressiveness = 1.0
 
+	# Adaptive budget controller parameters. Replacement starts only after the
+	# observed drawer has matured, then continues until the incoming fresh cohort
+	# makes it young again. The gap between the thresholds prevents rapid toggling.
+	reserve_fraction = 0.03
+	reserve_packs = 1
+	endgame_days = 15
+	replacement_start_age_ratio = 0.85
+	replacement_stop_age_ratio = 0.20
+
 	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
 		super().__init__(snapshot, ctx)
 
@@ -124,6 +136,8 @@ class Player8(BasePlayer):
 		self.days_seen = 0
 		self.history = SockHistory()
 		self.history_new = []
+		self.estimated_own_spend = 0.0
+		self.replacement_active = False
 
 	def select_socks(self, offered: tuple[int, ...], turn: TurnContext) -> Selection:
 		"""Choose two socks to wear, and decide the fate of the rest.
@@ -198,9 +212,10 @@ class Player8(BasePlayer):
 		black_mean, white_mean = self.history.recent_means(self.history_window, offered)
 		self.history.record(day=turn.day, offered=offered)
 
-		# Calculate the expected budget (today's estimated remaining budget)
+		# Estimate how much money must remain for the roommates' projected spend
+		# and a safety reserve, without changing how candidate socks are ranked.
 		total_budget: float = turn.budget_remaining + turn.total_spent
-		exp_budget: float = self.get_expected_budget(total_budget)
+		exp_budget = self._adaptive_budget_target(turn, total_budget)
 
 		# Edge cases
 		# Handle when a pair of socks cannot be made
@@ -300,50 +315,49 @@ class Player8(BasePlayer):
 			key=lambda i: abs(offered[i] - (64 if offered[i] <= 64 else 128)),
 		)[:discard_count]
 
+		self.estimated_own_spend += len(discard) * SOCK_COST
 		return Selection(wear=best_pair, discard=tuple(discard))
 
-	def get_expected_budget_simplified(self, total_budget: float) -> float:
-		total_days: int = self.days
-		current_day: int = self.days_seen
+	def _adaptive_budget_target(self, turn: TurnContext, total_budget: float) -> float:
+		"""Return how much of the shared budget should remain today.
 
-		# We consider three cases based on the `day_ratio`: [0, 0.333], (0.333, 0.667), [0.667, 1]
-		day_ratio: float = current_day / total_days
-		if day_ratio <= 0.333:
-			# At the beginning, we don't want to use any budget
-			return total_budget
-		elif day_ratio >= 0.667:
-			# At the final stage, we do not use any budget either
+		A decayed sample of the shared drawer controls a replacement cycle: wait
+		while the drawer is young, spend once it is mature, and stop after the new
+		cohort pulls the observed mean age back down. Household spend not imputed
+		to us estimates the roommates' future demand on the shared account.
+		"""
+		if total_budget == float('inf'):
 			return 0.0
-		else:
-			# We consider to spend the budget evenly
-			return (2 - 3 * day_ratio) * total_budget
 
-	def get_expected_budget(
-		self, total_budget: float, k1: float = 0.666, k2: float = 0.95
-	) -> float:
-		assert 0 <= k1 < k2 <= 1
+		days_left = max(0, self.days - turn.day)
+		reserve = min(
+			total_budget,
+			max(self.reserve_packs * PACK_COST, total_budget * self.reserve_fraction),
+		)
+		others_rate = max(0.0, (turn.total_spent - self.estimated_own_spend) / turn.day)
+		adaptive_floor = reserve + others_rate * days_left
+		adaptive_floor = min(total_budget, adaptive_floor)
+		if days_left < self.endgame_days or turn.budget_remaining <= adaptive_floor:
+			self.replacement_active = False
+			return turn.budget_remaining
 
-		total_days: int = self.days
-		current_day: int = self.days_seen
+		maturity = self._observed_drawer_maturity()
+		if self.replacement_active and maturity <= self.replacement_stop_age_ratio:
+			self.replacement_active = False
+		elif not self.replacement_active and maturity >= self.replacement_start_age_ratio:
+			self.replacement_active = True
 
-		# We consider three cases based on the `day_ratio`: [0, k1], (k1, k2), [k2, 1]
-		day_ratio: float = current_day / total_days
-		if day_ratio <= k1:
-			# At the beginning, we don't want to use any budget
-			return total_budget
-		elif day_ratio >= k2:
-			# At the final stage, we do not use any budget either
-			return 0.0
-		else:
-			# We consider to spend the budget evenly
-			return (k2 - day_ratio) * total_budget / (k2 - k1)
+		return adaptive_floor if self.replacement_active else turn.budget_remaining
 
-	def get_expected_budget_smoothened(self, total_budget: float) -> float:
-		total_days: int = self.days
-		current_day: int = self.days_seen
-
-		# We use `sin` to smoothen the expected budget
-		return 0.5 * total_budget * (1 + sin(pi / total_days * current_day + 0.5 * pi))
+	def _observed_drawer_maturity(self) -> float:
+		"""Mean observed wear age as a fraction of the 64-wear lifetime."""
+		recent = self.history.records[-self.history_window :]
+		ages = [
+			shade if shade <= 64 else (255 - shade) / 2
+			for observation in recent
+			for shade in observation.offered
+		]
+		return sum(ages) / len(ages) / 64 if ages else 0.0
 
 	def get_offered_sock_info(self, offered: tuple[int, ...]) -> list:
 		socks = []
