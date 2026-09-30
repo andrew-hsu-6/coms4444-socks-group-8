@@ -1,21 +1,37 @@
 # player 7 - pick how to spend from the budget on day 1, then stick with it.
 #
-# on the first morning we work out how many wears each sock would need to last
-# if the house spent its money evenly (the house wears 2n socks a day, so if we
-# can afford d new socks a day each one has to last about 2n/d wears). that
-# number puts us in one of three modes for the rest of the run:
-#   lavish - plenty of money, toss anything that doesn't match what we wore
-#   paced  - some money, toss socks once they've had their share of wears so
-#            the budget gets used evenly instead of all at once
-#   priced - not much money, give every move a cost in embarrassment points
-#            and pick the cheapest one
+# on the first morning we pick one of four modes for the whole run:
+#   cohort - most runs: under $0.60 a roommate a day, when the drawer plus
+#            every pack we can afford holds enough wears for the run (7% to
+#            spare with 4 sock hands)
+#   priced - the drawer will empty whatever we do: give every move a cost in
+#            embarrassment points and pick the cheapest, to put that off
+#   lavish - plenty of money: toss anything that doesn't match what we wore
+#   paced  - some money: toss socks once they've had their share of wears
 #
-# ideas we took from other groups and wrote our own way: the 2n/d wear count
-# (group 10), and scoring a whole move - mismatch, money and drawer fit - as one
-# number, with a worn out sock's hole risk counted as money (group 3)
+# cohort mode keeps each colour one batch of socks that fade together. with 4
+# socks in a hand and at most 3 batches in the drawer, two of them always
+# share a batch, so there is always a free pair. to keep it that way:
+#   - wear the free pair that pulls towards the batch: the mean of recent
+#     sightings in a tight drawer, the nearest group of shades in a roomy one
+#   - toss socks a brand new one would match better, so once holes bring in
+#     new socks the old batch goes and the colour turns over at once; the
+#     tosses may run up to 20% of the budget ahead of an even pace so a
+#     turnover happens in one burst instead of trickling
+#   - in a roomy drawer with money to spare, toss any sock that helps, and a
+#     sock left on its own: it can never be worn free, so it would never
+#     rejoin its batch, but six of them come back as one pack of six
+#   - with more money, retire each batch at the age the budget can pay for
+#     rather than waiting for holes - the same spend as paced mode, but the
+#     drawer stays one age instead of every age
+#   - always hold back the money for the holes still to come; when holes would
+#     outrun it, price moves like priced mode, and near the end of the run just
+#     stop tossing so the money lasts
 
+from collections import deque
 from dataclasses import dataclass, replace
 from itertools import combinations
+from math import ceil
 
 from models.player import GameContext, PlayerSnapshot, Selection, TurnContext
 from models.player import Player as BasePlayer
@@ -80,6 +96,75 @@ class Knobs:
 	priced_tosses_per_turn: int = 2
 	# priced mode: packs of money we never touch, in case roommates spend in bursts
 	reserve_packs: int = 1
+	# cohort mode: when to use it
+	# ...only below this many dollars per roommate per day
+	cohort_max_dollars: float = 0.6
+	# ...and, with 4 sock hands, only when the drawer plus every pack we can
+	# buy holds this many times the wears the run needs - near the line cohort
+	# mode spends the money the endgame needs, and priced mode stretches it
+	# further. 5 sock hands cope with a mixed drawer and don't need the margin
+	cohort_supply_margin: float = 1.07
+
+	# cohort mode: which pair to wear
+	# the batch is the last few sightings of a colour - more of them when the
+	# drawer turns over slowly: this many over the share of the drawer worn
+	# each day, for 4 and for 5 sock hands, clamped to the range
+	cohort_window_scale: tuple[float, float] = (0.8, 0.5)
+	cohort_window_range: tuple[int, int] = (5, 20)
+	# with at least this many drawer slots per roommate, pull each sock towards
+	# the nearest group of shades we've seen instead of the mean of its colour -
+	# in a roomy drawer stragglers last long enough to form groups of their
+	# own, in a tight one the groups are just noise
+	cohort_nearest_from: float = 8.0
+
+	# cohort mode: which socks to toss
+	# sightings of a colour needed before we toss any of it
+	cohort_min_seen: int = 3
+	# tosses per turn with 4 and with 5 sock hands
+	cohort_tosses: tuple[int, int] = (2, 1)
+	# a new sock must cut the average charge by more than this...
+	cohort_gain: float = 6.0
+	# ...or by more than this with money beyond the reserve and the even pace,
+	# in a drawer with at least this many slots per roommate (a tight drawer
+	# needs that money for its turnovers)
+	cohort_rich_gain: float = 0.0
+	cohort_rich_from: float = 6.0
+	# with 4 sock hands, toss a straggler: a sock the fading memory of recent
+	# hands puts fewer than this many others near (and never more than this
+	# share of the drawer, so a small drawer's ordinary groups don't count). it
+	# can never be worn free, so it never ages back into its batch, but six of
+	# them come back as one pack of six matching new socks
+	cohort_straggler: float = 5.0
+	cohort_straggler_share: float = 0.1
+	# ...only with at least this many drawer slots per roommate, and a budget
+	# this many times what letting every batch wear out would cost - otherwise
+	# the turnovers need the money
+	cohort_straggler_from: float = 6.0
+	cohort_straggler_ratio: float = 1.35
+	# ...and while retiring batches early, never a sock worn this few times: a
+	# new batch looks thin until the memory catches up with it
+	cohort_straggler_fresh: int = 4
+	# with at least this many dollars per roommate per day, don't wait for
+	# holes - retire a batch once it's this many times as old as the money can
+	# keep replacing it at
+	cohort_retire_from: float = 0.2
+	cohort_retire: float = 1.3
+
+	# cohort mode: money
+	# drawer slots we don't count on, and spare packs held back
+	cohort_slack_socks: int = 14
+	cohort_spare_packs: int = 1
+	# share of a new sock's 68 wears we count on - batches get tossed early
+	cohort_life_used: float = 0.9
+	# share of the budget our tosses may run ahead of an even pace, so a
+	# turnover can happen in one burst instead of trickling
+	cohort_burst: float = 0.2
+	# with 4 sock hands, over this last share of the run, stop tossing once
+	# holes coming this many times faster than the steady rate would run the
+	# house dry - a batch wearing out together loses socks in a burst, and
+	# there's no time left to recover from a drawer that has started to shrink
+	cohort_hole_burst_tail: float = 0.15
+	cohort_hole_burst: float = 1.6
 
 
 TUNED = Knobs()
@@ -128,6 +213,27 @@ def after_wash(shade: int) -> int:
 
 def colour(shade: int) -> str:
 	return 'w' if is_white(shade) else 'b'
+
+
+def wears_left(shade: float) -> float:
+	# wears before it fades out, plus the 4 a worn out sock lasts on average
+	# before it gets a hole
+	fade = (shade - WHITE_DONE) / 2 if is_white(int(shade)) else BLACK_DONE - shade
+	return fade + 4
+
+
+NEW_SOCK_WEARS = wears_left(WHITE_NEW)
+
+
+def shade_groups(shades) -> list[list[int]]:
+	# split shades wherever sorted neighbours are more than the free gap apart
+	groups: list[list[int]] = []
+	for shade in sorted(shades):
+		if groups and shade - groups[-1][-1] <= FREE_GAP:
+			groups[-1].append(shade)
+		else:
+			groups.append([shade])
+	return groups
 
 
 # ----------------------------------------------------------------------
@@ -268,10 +374,14 @@ class Player7(BasePlayer):
 		self.my_spend = 0.0
 		self.target_wears = 64.0
 		self.trust_target = 0.0
+		# cohort mode
+		self.recent: dict[str, deque[int]] = {}
 
 	def select_socks(self, offered: tuple[int, ...], turn: TurnContext) -> Selection:
 		if self.regime is None:
 			self.settle_regime(turn)
+		if self.regime == 'cohort':
+			return self.cohort_turn(offered, turn)
 		if self.regime == 'priced':
 			return self.priced_turn(offered, turn)
 		return self.ruled_turn(offered, turn)
@@ -280,6 +390,14 @@ class Player7(BasePlayer):
 		# decided once, from the whole budget over the whole run
 		k = TUNED
 		budget = turn.total_spent + turn.budget_remaining
+		if self.use_cohort(budget):
+			self.regime = 'cohort'
+			scale = k.cohort_window_scale[self.selection_unit >= 5]
+			lo, hi = k.cohort_window_range
+			size = max(lo, min(hi, round(scale * self.capacity / (2 * self.roommates))))
+			self.recent = {'w': deque(maxlen=size), 'b': deque(maxlen=size)}
+			self.memory = ShadeMemory(k.priced_memory_fade, 1e-3)
+			return
 		if budget != float('inf'):
 			rate = socks_per_day(k, budget, self.roommates, self.days)
 			if rate <= 0 or 2 * self.roommates / rate > k.priced_min_wears:
@@ -348,14 +466,16 @@ class Player7(BasePlayer):
 			self.swap_credit = min(self.swap_credit + spare / days_left / n / SOCK_COST, 3.0)
 		return wallet, k
 
-	def running_dry(self, turn: TurnContext, left: float, days_left: int) -> bool:
+	def running_dry(
+		self, turn: TurnContext, left: float, days_left: int, burst: float = 1.0
+	) -> bool:
 		# will holes from here on eat the spare socks plus what money can replace?
 		k, n = TUNED, self.roommates
 		lost = 0.0
 		if self.broke_since is not None:
 			lost = k.hole_rate * n * (turn.day - self.broke_since)
 		spare = self.capacity - lost - self.selection_unit * n - k.dry_margin
-		return k.hole_rate * n * days_left > spare + left / SOCK_COST
+		return burst * k.hole_rate * n * days_left > spare + left / SOCK_COST
 
 	@staticmethod
 	def closest_pair(hand: tuple[int, ...], avoid_done: bool, k: Knobs) -> tuple[int, int]:
@@ -424,9 +544,12 @@ class Player7(BasePlayer):
 	# priced: cheapest move wins
 	# ------------------------------------------------------------------
 
-	def priced_turn(self, hand: tuple[int, ...], turn: TurnContext) -> Selection:
+	def priced_turn(
+		self, hand: tuple[int, ...], turn: TurnContext, seen: bool = False
+	) -> Selection:
 		k, n = TUNED, self.roommates
-		self.memory.observe(hand, turn.day)
+		if not seen:
+			self.memory.observe(hand, turn.day)
 		days_left = max(self.days - turn.day + 1, 1)
 		left = turn.budget_remaining
 		broke = left < PACK_COST
@@ -495,3 +618,190 @@ class Player7(BasePlayer):
 		new, step = (WHITE_NEW, -2) if is_white(shade) else (BLACK_NEW, 1)
 		later = sum(charge(shade, new + step * a) for a in range(top + 1)) / (top + 1)
 		return (1 - self.trust_target) * now + self.trust_target * later
+
+	# ------------------------------------------------------------------
+	# cohort
+	# ------------------------------------------------------------------
+
+	def use_cohort(self, budget: float) -> bool:
+		# cohort mode spends close to the least it can, which is right when
+		# money is tight but wastes it when lavish tossing is affordable
+		if budget / (self.roommates * self.days) >= TUNED.cohort_max_dollars:
+			return False
+		# if the drawer plus every pack we can buy can't cover the run's wears,
+		# the drawer will empty whatever we do, and priced mode is better at
+		# putting that off
+		supply = (self.capacity + budget // PACK_COST * 6) * NEW_SOCK_WEARS
+		margin = TUNED.cohort_supply_margin if self.selection_unit == 4 else 1.0
+		return supply >= margin * 2 * self.roommates * self.days
+
+	def cohort_turn(self, hand: tuple[int, ...], turn: TurnContext) -> Selection:
+		for shade in hand:
+			self.recent[colour(shade)].append(shade)
+		self.memory.observe(hand, turn.day)
+		left = turn.budget_remaining
+		if left < PACK_COST and self.broke_since is None:
+			self.broke_since = turn.day
+		days_left = max(self.days - turn.day + 1, 1)
+		money = left if left >= PACK_COST else 0.0
+		if self.running_dry(turn, money, days_left):
+			# holes will shrink the drawer faster than money can refill it and a
+			# sockless day costs more than any mismatch, so price every move
+			# the way priced mode does until the money catches up again
+			return self.priced_turn(hand, turn, seen=True)
+		# near the end a batch wearing out loses socks in a burst, so judge dry
+		# with a faster hole rate there
+		tail = self.selection_unit == 4 and days_left <= TUNED.cohort_hole_burst_tail * self.days
+		if tail and self.running_dry(turn, money, days_left, TUNED.cohort_hole_burst):
+			# keep the money for the holes and keep every sock, but pair as usual
+			return Selection(wear=self.cohort_pair(hand), discard=())
+		wear = self.cohort_pair(hand)
+		rest = [i for i in range(len(hand)) if i not in wear]
+		return Selection(wear=wear, discard=self.cohort_tosses(hand, rest, turn))
+
+	def cohort_pair(self, hand: tuple[int, ...]) -> tuple[int, int]:
+		# of the free pairs, the one whose wash best pulls its socks towards
+		# their batch; with no free pair, the smallest mismatch
+		pairs = list(combinations(range(len(hand)), 2))
+		free = [p for p in pairs if charge(hand[p[0]], hand[p[1]]) == 0]
+		if not free:
+			return min(pairs, key=lambda p: abs(hand[p[0]] - hand[p[1]]))
+
+		centres = {c: self.batch_centre(c) for c in ('w', 'b')}
+		nearest = self.capacity / self.roommates >= TUNED.cohort_nearest_from
+		groups = {c: shade_groups(self.recent[c]) for c in ('w', 'b')}
+
+		def target(shade: int) -> float:
+			if nearest and groups[colour(shade)]:
+				# the group of recent sightings this sock sits closest to
+				near = min(groups[colour(shade)], key=lambda g: min(abs(x - shade) for x in g))
+				return sum(near) / len(near)
+			return centres[colour(shade)]
+
+		def drift(pair: tuple[int, int]) -> float:
+			# how much washing these two moves them away from their batch -
+			# negative means it pulls stragglers back in
+			moved = 0.0
+			for i in pair:
+				centre = target(hand[i])
+				moved += (after_wash(hand[i]) - centre) ** 2 - (hand[i] - centre) ** 2
+			return moved
+
+		return min(free, key=lambda p: (drift(p), abs(hand[p[0]] - hand[p[1]]), p))
+
+	def batch_centre(self, c: str) -> float:
+		seen = self.recent[c]
+		if not seen:
+			return WHITE_NEW if c == 'w' else BLACK_NEW
+		return sum(seen) / len(seen)
+
+	def cohort_tosses(self, hand: tuple[int, ...], rest: list[int], turn: TurnContext) -> tuple:
+		# which of the socks we aren't wearing to throw out, best first
+		if not rest or not self.cohort_can_spend(turn):
+			return ()
+		k = TUNED
+		bar = self.toss_bar(turn)
+		retire_at = self.retire_age(turn)
+		lonely = self.straggler_cut(turn)
+		# while retiring batches early, a new batch looks thin until the memory
+		# catches up with it - leave those socks alone
+		fresh = -1 if retire_at is None else k.cohort_straggler_fresh
+		picks = []
+		for i in rest:
+			shade = hand[i]
+			seen = self.recent[colour(shade)]
+			if len(seen) < k.cohort_min_seen:
+				continue
+			new = brand_new(shade)
+			gain = sum(charge(shade, s) - charge(new, s) for s in seen) / len(seen)
+			if gain > bar:
+				picks.append((-gain, i))
+			elif lonely and wears(shade) > fresh and self.company(shade) < lonely:
+				picks.append((0.0, i))
+			elif retire_at is not None and wears(shade) >= retire_at:
+				# the batch is as old as the money says it may get: start the
+				# turnover, and the gain rule clears the rest once new socks show
+				picks.append((0.0, i))
+		toss, lost = [], 0.0
+		for _, i in sorted(picks):
+			# every sock we toss is wears the house has to buy back
+			if turn.budget_remaining < self.cohort_reserve(turn, lost + wears_left(hand[i])):
+				continue
+			toss.append(i)
+			lost += wears_left(hand[i])
+			if len(toss) >= k.cohort_tosses[self.selection_unit >= 5]:
+				break
+		return tuple(sorted(toss))
+
+	def toss_bar(self, turn: TurnContext) -> float:
+		# how much a new sock must cut the average charge before we toss for it:
+		# anything at all in a roomy drawer with money beyond the reserve and the
+		# even pace, otherwise a clear improvement
+		k = TUNED
+		budget = turn.total_spent + turn.budget_remaining
+		surplus = turn.budget_remaining - self.cohort_reserve(turn, 0.0)
+		if budget != float('inf'):
+			surplus -= budget * (self.days - turn.day) / self.days
+		rich = surplus > PACK_COST * self.roommates
+		roomy = self.capacity / self.roommates >= k.cohort_rich_from
+		return k.cohort_rich_gain if rich and roomy else k.cohort_gain
+
+	def retire_age(self, turn: TurnContext) -> float | None:
+		# with enough money, the wear count at which to start retiring a batch:
+		# a whole batch replaced every A wears costs about 2n/A socks a day - the
+		# same money as paced mode, but the drawer stays one age
+		k = TUNED
+		budget = turn.total_spent + turn.budget_remaining
+		if budget / (self.roommates * self.days) < k.cohort_retire_from:
+			return None
+		days_left = max(self.days - turn.day + 1, 1)
+		per_day = turn.budget_remaining / days_left / SOCK_COST
+		if per_day <= 0:
+			return None
+		return max(k.min_toss_wears, k.cohort_retire * 2 * self.roommates / per_day)
+
+	def straggler_cut(self, turn: TurnContext) -> float:
+		# a sock with fewer than this many others near its shade is a straggler
+		# worth tossing - 0 when we don't toss stragglers in this run
+		k = TUNED
+		if self.selection_unit != 4 or self.capacity / self.roommates < k.cohort_straggler_from:
+			return 0.0
+		budget = turn.total_spent + turn.budget_remaining
+		if budget != float('inf'):
+			worn_out = 2 * self.roommates * self.days / NEW_SOCK_WEARS - self.capacity / 2
+			if budget < k.cohort_straggler_ratio * worn_out * SOCK_COST:
+				return 0.0
+		return min(k.cohort_straggler, k.cohort_straggler_share * self.capacity)
+
+	def company(self, shade: int) -> float:
+		# roughly how many socks of this colour sit within the free gap of it
+		seen = self.memory.same_colour(shade)
+		total = sum(seen.values())
+		if not total:
+			return float(self.capacity)
+		near = sum(w for s, w in seen.items() if abs(s - shade) <= FREE_GAP)
+		return near / total * self.capacity / 2
+
+	def cohort_can_spend(self, turn: TurnContext) -> bool:
+		left = turn.budget_remaining
+		if left < PACK_COST or left < self.cohort_reserve(turn, 0.0):
+			return False
+		budget = turn.total_spent + left
+		if budget == float('inf'):
+			return True
+		# don't get ahead of an even pace through the budget
+		return left / budget > (self.days - turn.day) / self.days - TUNED.cohort_burst
+
+	def cohort_reserve(self, turn: TurnContext, lost: float) -> float:
+		# money for the packs the house will need to finish the run, if the
+		# drawer we see now is worn down to holes, plus some spare
+		k = TUNED
+		per_colour = max(0.0, (self.capacity - max(10, k.cohort_slack_socks)) / 2)
+		supply = 0.0
+		for seen in self.recent.values():
+			life = sum(wears_left(s) for s in seen) / len(seen) if seen else NEW_SOCK_WEARS
+			supply += per_colour * life
+		supply = max(0.0, supply - lost)
+		need = 2 * self.roommates * (self.days - turn.day + 1)
+		packs = ceil(max(0.0, need - supply) / (k.cohort_life_used * NEW_SOCK_WEARS * 6))
+		return PACK_COST * (packs + k.cohort_spare_packs)

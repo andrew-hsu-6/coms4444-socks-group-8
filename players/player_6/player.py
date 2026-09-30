@@ -19,6 +19,8 @@ from math import exp
 from models.player import GameContext, PlayerSnapshot, Selection, TurnContext
 from models.player import Player as BasePlayer
 
+# Final Delierable
+
 THRESHOLD = 6
 BUCKETS = 8
 HIST_DECAY = 0.985
