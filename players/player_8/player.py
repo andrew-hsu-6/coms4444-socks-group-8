@@ -1,8 +1,9 @@
+from collections import deque
 from dataclasses import dataclass
 from itertools import combinations
 from math import ceil
 
-from core.engine import HOLE_PROBABILITY, PACK_COST, PACK_SIZE
+from core.engine import HOLE_PROBABILITY, PACK_COST, PACK_SIZE, SOCKLESS_PENALTY
 from models.player import GameContext, PlayerSnapshot, Selection, TurnContext
 from models.player import Player as BasePlayer
 
@@ -139,6 +140,16 @@ class Player8(BasePlayer):
 	replacement_horizon_days = 30
 	hole_replacement_rate_per_roommate = 1 / 34
 	unlimited_dollars_per_day = 7490 / 1080
+	# Try a brief opening pause, then require mature evidence for later pauses.
+	# Opening observations never qualify the drawer for long-term idle mode.
+	idle_enabled = True
+	opening_idle_days = 10
+	idle_warmup_days = 60
+	idle_window = 60
+	idle_max_bad_turns = 3
+	idle_max_embarrassment = 30
+	idle_recent_window = 5
+	idle_recent_bad_limit = 3
 
 	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
 		super().__init__(snapshot, ctx)
@@ -147,12 +158,18 @@ class Player8(BasePlayer):
 		self.discard_credit = 0.0
 		self.estimated_discard_spend = 0.0
 		self.estimated_household_replacements = 0.0
+		self.discard_mode = 'active'
+		self._opening_idle_finished = False
+		self._idle_costs: deque[float] = deque(maxlen=self.idle_window)
+		self._last_pairing_day = 0
 
 	def select_socks(self, offered: tuple[int, ...], turn: TurnContext) -> Selection:
 		"""Wear today's least embarrassing pair, then consider replacing leftovers."""
 		socks = self._get_offered_sock_info(offered)
 		self.history.record(day=turn.day, offered=offered, socks=socks)
 		n = len(offered)
+		if n < 2:
+			self._pause_discards(SOCKLESS_PENALTY, turn.day)
 		if n == 0:
 			return Selection(wear=(), discard=())
 		if n == 1:
@@ -165,6 +182,9 @@ class Player8(BasePlayer):
 		)['indices']
 		worn = set(best_pair)
 		unworn = [i for i in range(n) if i not in worn]
+		gap = abs(offered[best_pair[0]] - offered[best_pair[1]])
+		if self._pause_discards(gap if gap > FREE_SHADE_GAP else 0, turn.day):
+			return Selection(wear=best_pair, discard=())
 		if unworn and self._budget_guarantees_all_discards(turn):
 			# Even if both worn socks hole every day, this budget can pay for
 			# every possible pack. Discard all leftovers to refresh the pool.
@@ -186,6 +206,50 @@ class Player8(BasePlayer):
 		self.discard_credit -= len(discard)
 		self.estimated_discard_spend += len(discard) * SOCK_PRICE
 		return Selection(wear=best_pair, discard=discard)
+
+	def _pause_discards(self, embarrassment: float, day: int) -> bool:
+		"""Allow rare small losses before entry, but exit on the first idle loss.
+
+		An opening trial ends after ten days or its first loss. Remaining warmup
+		uses the original policy; neither phase supplies later entry evidence.
+		A missing turn invalidates evidence: the engine skips sockless players.
+		After an exit, collect a fresh full window before considering reentry.
+		"""
+		if not self.idle_enabled:
+			self._opening_idle_finished = True
+			self.discard_mode = 'active'
+			self._idle_costs.clear()
+			return False
+		if day != self._last_pairing_day + 1:
+			self._opening_idle_finished = True
+			self._idle_costs.clear()
+			self.discard_mode = 'active'
+		self._last_pairing_day = day
+		if not self._opening_idle_finished:
+			if day <= self.opening_idle_days and embarrassment == 0:
+				self.discard_mode = 'opening_idle'
+				self._idle_costs.clear()
+				self.discard_credit = 0.0
+				return True
+			self._opening_idle_finished = True
+			self.discard_mode = 'active'
+		if day <= self.idle_warmup_days or (self.discard_mode == 'idle' and embarrassment > 0):
+			self._idle_costs.clear()
+			self.discard_mode = 'active'
+			return False
+		self._idle_costs.append(embarrassment)
+		recent = list(self._idle_costs)[-self.idle_recent_window :]
+		paused = (
+			len(self._idle_costs) == self.idle_window
+			and sum(cost > 0 for cost in self._idle_costs) <= self.idle_max_bad_turns
+			and sum(self._idle_costs) <= self.idle_max_embarrassment
+			and sum(cost > 0 for cost in recent) < self.idle_recent_bad_limit
+		)
+		self.discard_mode = 'idle' if paused else 'active'
+		if paused:
+			# Do not bank a burst of discretionary spending during a pause.
+			self.discard_credit = 0.0
+		return paused
 
 	def _budget_guarantees_all_discards(self, turn: TurnContext) -> bool:
 		"""Can the starting budget buy every pack the entire game could need?
