@@ -11,7 +11,9 @@ MAX_AGE = 64
 FREE_SHADE_GAP = 6
 
 
-def mismatch_curve(weights: list[float], shade_step: int) -> list[float]:
+def mismatch_curve(
+	weights: list[float], shade_step: int, ages: tuple[int, ...] | None = None
+) -> list[float]:
 	"""Expected embarrassment at every age; weights may be unnormalized.
 
 	Two cumulative totals let us sum only partners outside the free shade gap.
@@ -23,13 +25,13 @@ def mismatch_curve(weights: list[float], shade_step: int) -> list[float]:
 		prefix_mass.append(prefix_mass[-1] + weights[age])
 		prefix_age.append(prefix_age[-1] + weights[age] * age)
 	free_radius = FREE_SHADE_GAP // shade_step
-	curve = []
-	for age in range(MAX_AGE + 1):
+	curve = [0.0] * (MAX_AGE + 1)
+	for age in range(MAX_AGE + 1) if ages is None else ages:
 		lower = max(0, age - free_radius)
 		upper = min(MAX_AGE + 1, age + free_radius + 1)
 		younger = age * prefix_mass[lower] - prefix_age[lower]
 		older = prefix_age[-1] - prefix_age[upper] - age * (prefix_mass[-1] - prefix_mass[upper])
-		curve.append(max(0.0, shade_step * (younger + older)))
+		curve[age] = max(0.0, shade_step * (younger + older))
 	return curve
 
 
@@ -41,6 +43,7 @@ def future_mismatch(
 	survival: float,
 	wear_horizon: float,
 	survival_cap: float = 0.98,
+	target_ages: tuple[int, ...] | None = None,
 ) -> list[float]:
 	"""Discount future mismatch for each current age over the remaining game.
 
@@ -51,6 +54,7 @@ def future_mismatch(
 	forecast = [0.0] * (MAX_AGE + 1)
 	if wear_horizon <= 0:
 		return forecast
+	ages = tuple(range(MAX_AGE + 1)) if target_ages is None else target_ages
 	mass = sum(age_weights)
 	observed = [weight / mass for weight in age_weights] if mass else [0.0] * (MAX_AGE + 1)
 	arrivals = [(1.0 - survival) * survival**age for age in range(MAX_AGE + 1)]
@@ -59,8 +63,9 @@ def future_mismatch(
 	discount = min(survival, survival_cap)
 	for wear in range(min(MAX_AGE, ceil(wear_horizon))):
 		interval = discount**wear - discount ** min(wear + 1.0, wear_horizon)
-		observed_cost = mismatch_curve(observed, shade_step)
-		for age in range(MAX_AGE + 1):
+		aged_ages = tuple(dict.fromkeys(min(MAX_AGE, age + wear) for age in ages))
+		observed_cost = mismatch_curve(observed, shade_step, aged_ages)
+		for age in ages:
 			aged = min(MAX_AGE, age + wear)
 			expected = (1.0 - replacement_share) * observed_cost[aged]
 			expected += replacement_share * arrival_cost[aged]
@@ -70,7 +75,11 @@ def future_mismatch(
 	if wear_horizon > MAX_AGE:
 		remaining = replacement_share * (discount**MAX_AGE - discount**wear_horizon)
 		tail_cost = remaining * arrival_cost[MAX_AGE]
-		forecast = [value + tail_cost for value in forecast]
+		if target_ages is None:
+			forecast = [value + tail_cost for value in forecast]
+		else:
+			for age in ages:
+				forecast[age] += tail_cost
 	return forecast
 
 
@@ -290,6 +299,18 @@ class Player8(BasePlayer):
 				replacement_share=replacement_share,
 				survival=survival,
 				wear_horizon=wear_horizon,
+				target_ages=tuple(
+					sorted(
+						{
+							0,
+							*(
+								socks[index]['age']
+								for index in unworn
+								if socks[index]['color'] == color
+							),
+						}
+					)
+				),
 			)
 			for color in {socks[index]['color'] for index in unworn}
 		}
